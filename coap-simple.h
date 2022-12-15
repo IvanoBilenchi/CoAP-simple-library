@@ -37,6 +37,9 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #ifndef COAP_BUF_MAX_SIZE
 #define COAP_BUF_MAX_SIZE 128
 #endif
+#ifndef COAP_BLOCK_SZX
+#define COAP_BLOCK_SZX 2
+#endif
 #define COAP_DEFAULT_PORT 5683
 
 #define RESPONSE_CODE(class, detail) ((class << 5) | (detail))
@@ -62,6 +65,7 @@ typedef enum {
     COAP_VALID = RESPONSE_CODE(2, 3),
     COAP_CHANGED = RESPONSE_CODE(2, 4),
     COAP_CONTENT = RESPONSE_CODE(2, 5),
+    COAP_CONTINUE = RESPONSE_CODE(2, 31),
     COAP_BAD_REQUEST = RESPONSE_CODE(4, 0),
     COAP_UNAUTHORIZED = RESPONSE_CODE(4, 1),
     COAP_BAD_OPTION = RESPONSE_CODE(4, 2),
@@ -93,6 +97,8 @@ typedef enum {
     COAP_URI_QUERY = 15,
     COAP_ACCEPT = 17,
     COAP_LOCATION_QUERY = 20,
+    COAP_BLOCK_2 = 23,
+    COAP_BLOCK_1 = 27,
     COAP_PROXY_URI = 35,
     COAP_PROXY_SCHEME = 39
 } COAP_OPTION_NUMBER;
@@ -116,6 +122,9 @@ class CoapOption {
 };
 
 class CoapPacket {
+    private:
+        bool getBlock(COAP_OPTION_NUMBER num, uint16_t *block_num, bool *more, uint16_t *block_size);
+
     public:
 		uint8_t type = 0;
 		uint8_t code = 0;
@@ -128,6 +137,8 @@ class CoapPacket {
 		CoapOption options[COAP_MAX_OPTION_NUM];
 
 		void addOption(uint8_t number, uint8_t length, uint8_t *opt_payload);
+        bool getBlock1(uint16_t *block_num, bool *more, uint16_t *block_size);
+        bool getBlock2(uint16_t *block_num, bool *more, uint16_t *block_size);
 };
 
 #if defined(ESP8266)
@@ -178,6 +189,7 @@ class Coap {
         CoapCallback resp;
         int _port;
         int coap_buf_size;
+        uint8_t coap_block_szx;
         uint8_t *tx_buffer = NULL;
         uint8_t *rx_buffer = NULL;
 
@@ -188,7 +200,8 @@ class Coap {
     public:
         Coap(
             UDP& udp,
-            int coap_buf_size = COAP_BUF_MAX_SIZE
+            int coap_buf_size = COAP_BUF_MAX_SIZE,
+            uint8_t coap_block_szx = COAP_BLOCK_SZX
         );
         ~Coap();
         bool start();
@@ -200,6 +213,8 @@ class Coap {
         uint16_t sendResponse(IPAddress ip, int port, uint16_t messageid, const char *payload);
         uint16_t sendResponse(IPAddress ip, int port, uint16_t messageid, const char *payload, size_t payloadlen);
         uint16_t sendResponse(IPAddress ip, int port, uint16_t messageid, const char *payload, size_t payloadlen, COAP_RESPONSE_CODE code, COAP_CONTENT_TYPE type, const uint8_t *token, int tokenlen);
+        bool sendBlock2Response(IPAddress ip, int port, uint16_t messageid, const char *payload, size_t payloadlen, COAP_CONTENT_TYPE type, const uint8_t *token, int tokenlen, uint16_t block_num);
+        bool sendBlock1Ack(IPAddress ip, int port, uint16_t messageid, COAP_RESPONSE_CODE code, const uint8_t *token, int tokenlen, uint16_t block_num);
         
         uint16_t get(IPAddress ip, int port, const char *url);
         uint16_t put(IPAddress ip, int port, const char *url, const char *payload);

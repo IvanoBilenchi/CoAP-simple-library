@@ -12,13 +12,48 @@ void CoapPacket::addOption(uint8_t number, uint8_t length, uint8_t *opt_payload)
     ++optionnum;
 }
 
+bool CoapPacket::getBlock(COAP_OPTION_NUMBER num, uint16_t *block_num, bool *more,
+                          uint16_t *block_size)
+{
+    for (uint8_t i = 0; i < optionnum; ++i) {
+        CoapOption &opt = options[i];
+        if (opt.number == num) {
+            uint8_t l_byte;
+            uint16_t l_block_num;
+
+            if (opt.length == 1) {
+                l_byte = *opt.buffer;
+                l_block_num = l_byte >> 4;
+            } else {
+                l_byte = opt.buffer[1];
+                l_block_num = ((uint16_t)options[i].buffer[0]) << 4 | options[i].buffer[1] >> 4;
+            }
+
+            if (block_num) *block_num = l_block_num;
+            if (more) *more = (l_byte & 0x8) == 0x8;
+            if (block_size) *block_size = 1u << ((l_byte & 0x7) + 4);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CoapPacket::getBlock1(uint16_t *block_num, bool *more, uint16_t *block_size) {
+    return getBlock(COAP_BLOCK_1, block_num, more, block_size);
+}
+
+bool CoapPacket::getBlock2(uint16_t *block_num, bool *more, uint16_t *block_size) {
+    return getBlock(COAP_BLOCK_2, block_num, more, block_size);
+}
 
 Coap::Coap(
     UDP& udp,
-    int coap_buf_size  /* default value is COAP_BUF_MAX_SIZE */
+    int coap_buf_size,  /* default value is COAP_BUF_MAX_SIZE */
+    uint8_t coap_block_szx  /* default value is COAP_BLOCK_SZX */
 ) {
     this->_udp = &udp;
     this->coap_buf_size = coap_buf_size;
+    this->coap_block_szx = coap_block_szx;
     this->tx_buffer = new uint8_t[this->coap_buf_size];
     this->rx_buffer = new uint8_t[this->coap_buf_size];
 }
@@ -113,7 +148,14 @@ uint16_t Coap::sendPacket(CoapPacket &packet, IPAddress ip, int port) {
     }
 
     _udp->beginPacket(ip, port);
-    _udp->write(this->tx_buffer, packetSize);
+
+    uint8_t *buf_ptr = this->tx_buffer;
+    while (packetSize) {
+        uint16_t written = _udp->write(buf_ptr, packetSize);
+        buf_ptr += written;
+        packetSize -= written;
+    }
+
     _udp->endPacket();
 
     return packet.messageid;
@@ -299,7 +341,7 @@ bool Coap::loop() {
 
             if (!uri.find(url)) {
                 sendResponse(_udp->remoteIP(), _udp->remotePort(), packet.messageid, NULL, 0,
-                        COAP_NOT_FOUNT, COAP_NONE, NULL, 0);
+                        COAP_NOT_FOUNT, COAP_NONE, packet.token, packet.tokenlen);
             } else {
                 uri.find(url)(packet, _udp->remoteIP(), _udp->remotePort());
             }
@@ -331,9 +373,8 @@ uint16_t Coap::sendResponse(IPAddress ip, int port, uint16_t messageid, const ch
     return this->sendResponse(ip, port, messageid, payload, payloadlen, COAP_CONTENT, COAP_TEXT_PLAIN, NULL, 0);
 }
 
-
 uint16_t Coap::sendResponse(IPAddress ip, int port, uint16_t messageid, const char *payload, size_t payloadlen,
-                COAP_RESPONSE_CODE code, COAP_CONTENT_TYPE type, const uint8_t *token, int tokenlen) {
+                            COAP_RESPONSE_CODE code, COAP_CONTENT_TYPE type, const uint8_t *token, int tokenlen) {
     // make packet
     CoapPacket packet;
 
@@ -347,10 +388,101 @@ uint16_t Coap::sendResponse(IPAddress ip, int port, uint16_t messageid, const ch
     packet.messageid = messageid;
 
     // if more options?
-    uint8_t optionBuffer[2] = {0};
-    optionBuffer[0] = ((uint16_t)type & 0xFF00) >> 8;
-    optionBuffer[1] = ((uint16_t)type & 0x00FF) ;
-	packet.addOption(COAP_CONTENT_FORMAT, 2, optionBuffer);
+    if (payloadlen) {
+        uint8_t content_opt[2] = {0};
+        content_opt[0] = ((uint16_t)type & 0xFF00) >> 8;
+        content_opt[1] = ((uint16_t)type & 0x00FF) ;
+        packet.addOption(COAP_CONTENT_FORMAT, 2, content_opt);
+    }
+
+    return this->sendPacket(packet, ip, port);
+}
+
+bool Coap::sendBlock2Response(IPAddress ip, int port, uint16_t messageid, const char *payload, size_t payloadlen,
+                              COAP_CONTENT_TYPE type, const uint8_t *token, int tokenlen, uint16_t block_num) {
+    size_t const coap_block_size = 1u << (this->coap_block_szx + 4);
+
+    if (block_num == 0 && coap_block_size >= payloadlen) {
+        // No need for actual block response.
+        this->sendResponse(ip, port, messageid, payload, payloadlen,
+                           COAP_CONTENT, type, token, tokenlen);
+        return true;
+    }
+
+    uint8_t block_opt_low_bits = this->coap_block_szx;
+    size_t block_len;
+    bool last;
+
+    if (payloadlen <= coap_block_size * (block_num + 1)) {
+        // Last block
+        last = true;
+        block_len = payloadlen % coap_block_size;
+        if (!block_len) block_len = coap_block_size;
+    } else {
+        last = false;
+        block_len = coap_block_size;
+        block_opt_low_bits |= (uint8_t)(1u << 3u); // M: 1
+    }
+
+    CoapPacket packet;
+    packet.type = COAP_ACK;
+    packet.code = COAP_CONTENT;
+    packet.token = token;
+    packet.tokenlen = tokenlen;
+    packet.payload = (uint8_t *)(payload + block_num * coap_block_size);
+    packet.payloadlen = block_len;
+    packet.optionnum = 0;
+    packet.messageid = messageid;
+
+    uint8_t content_opt[2] = {0};
+    content_opt[0] = (uint16_t)type >> 8;
+    content_opt[1] = (uint16_t)type & 0x00FF;
+    packet.addOption(COAP_CONTENT_FORMAT, 2, content_opt);
+
+    uint8_t block_opt[2] = {0};
+    uint16_t block = block_num << 4 | block_opt_low_bits;
+
+    if (block_num < 16) {
+        block_opt[0] = (uint8_t)block;
+        packet.addOption(COAP_BLOCK_2, 1, block_opt);
+    } else {
+        block_opt[0] = block >> 8;
+        block_opt[1] = (block & 0x00FF);
+        packet.addOption(COAP_BLOCK_2, 2, block_opt);
+    }
+
+    this->sendPacket(packet, ip, port);
+
+    return last;
+}
+
+bool Coap::sendBlock1Ack(IPAddress ip, int port, uint16_t messageid, COAP_RESPONSE_CODE code,
+                         const uint8_t *token, int tokenlen, uint16_t block_num) {
+    CoapPacket packet;
+
+    packet.type = COAP_ACK;
+    packet.code = code;
+    packet.token = token;
+    packet.tokenlen = tokenlen;
+    packet.payload = NULL;
+    packet.payloadlen = 0;
+    packet.optionnum = 0;
+    packet.messageid = messageid;
+
+    uint8_t block_opt_low_bits = this->coap_block_szx;
+    if (code == COAP_CONTINUE) block_opt_low_bits |= 0x8;
+
+    uint8_t block_opt[2] = {0};
+    uint16_t block = block_num << 4 | block_opt_low_bits;
+
+    if (block_num < 16) {
+        block_opt[0] = (uint8_t)block;
+        packet.addOption(COAP_BLOCK_1, 1, block_opt);
+    } else {
+        block_opt[0] = block >> 8;
+        block_opt[1] = (block & 0x00FF);
+        packet.addOption(COAP_BLOCK_1, 2, block_opt);
+    }
 
     return this->sendPacket(packet, ip, port);
 }
